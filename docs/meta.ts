@@ -25,7 +25,6 @@ export default defineMeta({
     "wayland-layer-shell",
     "architecture",
     "development",
-    "local-environment",
     "testing-and-validation",
     "release",
   ],
