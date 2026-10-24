@@ -1,307 +1,98 @@
-import { app, BrowserWindow, screen } from "electron";
-import { mkdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
 
-import { getAppStateSnapshot, getPetThrowPhysics, type HudScaleValue, type PetScaleValue } from "./app-state.js";
-import { clampToNearestDisplayIfOffscreen, clampToVisibleWorkArea, defaultPetWindowSize, getDefaultPetInitialPosition, isCrossDisplayRoamingEnabled, type Point } from "./display.js";
-import { builtInPet } from "./built-in-pet.js";
-import { t } from "./i18n/index.js";
-import { debug, error as logError, info, warn } from "./logger.js";
-import { defaultPetSprite, type PetMotionState, type UniversalSpriteState } from "./reaction-animation-mapping.js";
-import { computeEffectiveWaylandBackend, isLayerShellBackendRequested, shouldPetWindowBeFocusable } from "./wayland-backend.js";
-import { adoptPetWindowForLayerShell, isLayerShellHelperAvailable } from "./wayland-layer-backend.js";
-import { isLatestPetRenderSequence } from "./pet-render-lifecycle.js";
-import { calculatePetInteractiveShape } from "./pet-window-shape.js";
-import { toCollapsedPosition } from "./default-pet-chat-geometry.js";
-import { getActiveChatPanelHeight, isDefaultPetCarrierExpanded, isDefaultPetChatCompactOpen, isDefaultPetSessionOpen } from "./default-pet-chat.js";
-import { getVoiceAssistantSnapshot } from "./voice-assistant-host.js";
+import { BrowserWindow, Menu, app, ipcMain, screen, type IpcMainEvent, type WebContents } from "electron";
 
-import type { AgentPetWindowOptions, DefaultPetWindowOptions, PetContentRender, PetPluginBubbles, PetShowMediaOptions, PetStatusBadgeReaction, PetTransientDisplay, PetWindowAudioPayload, PetWindowInteractionHooks, PetWindowSpeechCompletion } from "./pet-window-types.js";
-import { createBubbleMarkup, createBuiltInPetRender, createDefaultPetRenderContent, createInstalledPetRender } from "./pet-window-render.js";
-import { registerPetGazeWindow, resetPetGazeWindow, setPetGazeDragging, setPetGazeMotionState, setPetGazePluginOverride, setPetGazeReactionState, setPetGazeRendererReady, setPetGazeScale, suspendPetGazeForMovement, updatePetGazeConfiguration } from "./pet-window-gaze.js";
-import { installPetContextMenu } from "./pet-window-context-menu.js";
-import { installPetWindowInteraction } from "./pet-window-interaction.js";
-import { beginPetWindowX11MapLifecycle, type PetWindowX11MapLifecycle } from "./x11-pet-window-state.js";
-import { createPetWindowShowCoordinator, type PetWindowShowCoordinator } from "./pet-window-show-coordinator.js";
-import { finishPetActivitySpeech, movePetActivityWindow, preparePetActivityRender, registerPetActivityWindow, setPetActivityPluginOverride, setPetActivityReactionOverride, setPetActivityScale, startPetActivitySpeech, updatePetActivityRender } from "./pet-activities.js";
+import { getAppState, setPetPosition } from "./app-state.js";
+import { builtInPet, petSpriteUrl } from "./built-in-pet.js";
+import { clampPetPosition, getDefaultPetPosition, getPetWindowSize, type WindowSize } from "./display.js";
+import { logError, logInfo } from "./logger.js";
+import {
+  CHAT_PANEL_EXTRA_HEIGHT,
+  CHAT_PANEL_MIN_WIDTH,
+  VOICE_PANEL_EXTRA_HEIGHT,
+  VOICE_PANEL_MIN_WIDTH,
+  reactionDurationMs,
+} from "./pet-render.js";
+import {
+  BUILT_IN_PET_ID,
+  type PetConversationView,
+  type PetReaction,
+  type PetSummary,
+  type PetWindowLayout,
+} from "./shared-types.js";
 
-export type { AgentPetWindowOptions, DefaultPetWindowOptions, PetContentRender, PetPluginBubbles, PetShowMediaOptions, PetStatusBadgeReaction, PetTransientDisplay, PetWindowAudioPayload, PetWindowInteractionHooks, PetWindowSpeechCompletion } from "./pet-window-types.js";
-export { createPetBodyMarkup, pluginBubblesCacheKey } from "./pet-window-render.js";
-export { refreshPetGazePreference } from "./pet-window-gaze.js";
-export { buildPetContextMenuTemplate, handlePetScaleChange } from "./pet-window-context-menu.js";
-export { clearTransientReaction, getTransientDisplayDurationMs, getTransientReactionAnimationMs, mergePetTransientDisplay, preparePetTransientDisplay } from "./pet-transient-policy.js";
+export interface PetWindowHooks {
+  readonly onVisibilityChanged: () => void;
+  readonly onOpenControlCenter: () => void;
+  readonly onChatToggle: () => void;
+  readonly onChatSend: (text: string) => void;
+  readonly onChatClose: () => void;
+  readonly onMicChunk: (bytes: Uint8Array) => void;
+  readonly onMicEnded: () => void;
+  readonly onMicError: (message: string) => void;
+  readonly onContentLoaded: () => void;
+}
 
-const petWindowRenderCache = new WeakMap<BrowserWindow, string>();
-let petWindowSpeechSequence = 0;
+const maxChatMessageLength = 500;
+const maxAudioChunkBytes = 8 * 1024;
 
-const windowLoadChains = new WeakMap<BrowserWindow, Promise<void>>();
-const windowLoadSequences = new WeakMap<BrowserWindow, number>();
-const petWindowFocusPolicy = new WeakMap<BrowserWindow, boolean>();
-const petWindowShowCoordinators = new WeakMap<BrowserWindow, PetWindowShowCoordinator>();
-const petWindowLayerShellBackends = new WeakMap<BrowserWindow, boolean>();
-const petWindowX11MapLifecycles = new WeakMap<BrowserWindow, PetWindowX11MapLifecycle>();
+let petWindow: BrowserWindow | null = null;
+let hooks: PetWindowHooks | null = null;
+let quitting = false;
+let reactionTimer: NodeJS.Timeout | null = null;
+let saveTimer: NodeJS.Timeout | null = null;
+let dragState: { readonly cursorX: number; readonly cursorY: number; readonly windowX: number; readonly windowY: number } | null = null;
+let ipcRegistered = false;
+let currentLayout: PetWindowLayout = "base";
 
-/** All live pet windows participating in the shared always-on-top contract. */
-const trackedPetWindows = new Set<BrowserWindow>();
-const loggedWaylandTopmost = new WeakSet<BrowserWindow>();
-let petWindowAlwaysOnTopTimer: NodeJS.Timeout | null = null;
+export function configurePetWindow(nextHooks: PetWindowHooks): void {
+  hooks = nextHooks;
+}
 
-function reassertAllPetWindows(): void {
-  for (const candidate of [...trackedPetWindows]) {
-    if (candidate.isDestroyed()) {
-      trackedPetWindows.delete(candidate);
-      continue;
-    }
-    if (!candidate.isVisible()) continue;
-    applyPetAlwaysOnTop(candidate);
+export function getCurrentPet(): PetSummary {
+  const state = getAppState();
+  const petId = state.preferences.defaultPetId;
+  if (petId === BUILT_IN_PET_ID) {
+    return builtInPet;
   }
+  const installed = state.installedPets.find((pet) => pet.id === petId);
+  if (!installed) {
+    return builtInPet;
+  }
+  return {
+    id: installed.id,
+    displayName: installed.displayName,
+    description: installed.description,
+    builtIn: false,
+    spriteVersion: installed.spriteVersion,
+    spriteUrl: petSpriteUrl(installed.id),
+  };
 }
 
-function ensurePetWindowAlwaysOnTopTimer(): void {
-  if (petWindowAlwaysOnTopTimer) return;
-  const cadence = process.platform === "win32" ? 1_000 : 2_000;
-  petWindowAlwaysOnTopTimer = setInterval(() => {
-    for (const candidate of [...trackedPetWindows]) {
-      if (candidate.isDestroyed()) trackedPetWindows.delete(candidate);
-    }
-    reassertAllPetWindows();
-    if (trackedPetWindows.size === 0 && petWindowAlwaysOnTopTimer) {
-      clearInterval(petWindowAlwaysOnTopTimer);
-      petWindowAlwaysOnTopTimer = null;
-    }
-  }, cadence);
-  petWindowAlwaysOnTopTimer.unref?.();
-}
-export { isPetWindowDragging, recoverPetMouseInterop, subscribePetWindowSpeechCompletion } from "./pet-window-interaction.js";
-
-/**
- * Returns true when Electron is effectively running on the native Wayland
- * backend (ozone-platform=wayland). Under x11/XWayland this returns false
- * even on a Wayland session, because the positioning and z-order APIs work.
- *
- * Must be called after app is ready (after main.ts has appended the switch).
- * Cached on first call so window-creation cost is negligible.
- */
-let _effectiveWaylandBackendCache: boolean | undefined;
-export function isEffectiveWaylandBackend(): boolean {
-  if (_effectiveWaylandBackendCache !== undefined) return _effectiveWaylandBackendCache;
-  // Delegate to the pure, Electron-free decision in wayland-backend.ts so the
-  // exact production logic is unit-testable without importing this module.
-  const result = computeEffectiveWaylandBackend(
-    process.platform,
-    app.commandLine.getSwitchValue("ozone-platform"),
-    process.env.XDG_SESSION_TYPE,
-    process.env.WAYLAND_DISPLAY,
-  );
-  _effectiveWaylandBackendCache = result;
-  return result;
+export function isPetWindowVisible(): boolean {
+  return Boolean(petWindow && !petWindow.isDestroyed() && petWindow.isVisible());
 }
 
-export function _resetEffectiveWaylandBackendCache(): void {
-  _effectiveWaylandBackendCache = undefined;
+export function isPetWebContents(contents: WebContents | null | undefined): boolean {
+  return Boolean(petWindow && !petWindow.isDestroyed() && contents === petWindow.webContents);
 }
 
-/**
- * Whether to use Wayland native window-move drag instead of the manual
- * setBounds drag path.  Under x11/XWayland the manual path works correctly.
- * In layer-shell mode the pet is dragged by the native helper (which moves
- * the overlay surface directly), so the renderer must not participate in the
- * manual setBounds drag either — it would fight the helper's own motion.
- */
-export function shouldUseWaylandNativePetDrag(): boolean {
-  return isEffectiveWaylandBackend() || shouldUseLayerShellBackend();
-}
-
-export function createDefaultPetWindow(options: DefaultPetWindowOptions, dismissToken?: string): BrowserWindow {
-  const window = createBasePetWindow(
-    "OpenPets — Default Pet",
-    options.position,
-    { hasInteractiveInput: petPluginBubblesHaveInteractiveInput(options.pluginBubbles ?? null) },
-    (fallbackPosition, wasVisible) => {
-      // layer-shell backend failed asynchronously — rebuild as a normal window
-      // at the pet's latest tracked position, not its original spawn point.
-      info("pet.window", "layer-shell failed; rebuilding default pet as a normal window", { position: fallbackPosition, wasVisible });
-      const replacement = createBasePetWindowWithMode("OpenPets — Default Pet", fallbackPosition, { hasInteractiveInput: petPluginBubblesHaveInteractiveInput(options.pluginBubbles ?? null) }, false);
-      installDefaultPetWindow(replacement, options, dismissToken);
-      options.onWindowReplaced?.(replacement);
-      if (wasVisible) showPetWindowInactive(replacement);
-    },
-  );
-  if (!window.isDestroyed()) installDefaultPetWindow(window, options, dismissToken);
-  return window;
-}
-
-function installDefaultPetWindow(window: BrowserWindow, options: DefaultPetWindowOptions, dismissToken?: string): void {
-  registerPetActivityWindow(window, () => {
-    if (isDefaultPetCarrierExpanded() || isDefaultPetChatCompactOpen()) {
-      return "This pet is busy with an interaction.";
-    }
-    const voice = getVoiceAssistantSnapshot();
-    if (voice.activity !== null || (voice.status !== "idle" && voice.status !== "ended")) {
-      return "This pet is busy with voice.";
-    }
-    return null;
-  });
-  info("pet.window", "default window create", { windowId: window.id, position: options.position, paused: options.paused, hasDisplay: Boolean(options.display), badge: options.badge });
-  installPetWindowInteraction(window, {
-    useWaylandNativeDrag: shouldUseWaylandNativePetDrag(),
-    readWindowPosition,
-    getThrowPhysics: getPetThrowPhysics,
-  }, options);
-  installMotionStatePublisher(window);
-  installPetContextMenu(window, { label: t("pet.menu.hidePet"), click: options.onHideRequested, defaultPet: true }, shouldUseLayerShellBackend);
-
-  const savePosition = debounce(() => {
-    if (window.isDestroyed()) {
-      return;
-    }
-
-    options.onPositionChanged(readWindowPosition(window));
-  }, 150);
-
-  window.on("move", savePosition);
-  window.on("moved", savePosition);
-  window.on("close", (event) => {
-    event.preventDefault();
-    info("pet.window", "default window close", { windowId: window.id, position: readWindowPosition(window) });
-    options.onWindowCloseRequested();
-  });
-
-  void loadDefaultPetContent(window, options.paused, options.display, options.badge, dismissToken, options.pluginBubbles ?? null);
-}
-
-export function createAgentPetWindow(options: AgentPetWindowOptions, dismissToken?: string): BrowserWindow {
-  const window = createBasePetWindow(
-    `OpenPets — ${options.displayName}`,
-    options.position,
-    {},
-    (fallbackPosition, wasVisible) => {
-      // layer-shell backend failed asynchronously — rebuild as a normal window
-      // at the pet's latest tracked position, not its original spawn point.
-      info("pet.window", "layer-shell failed; rebuilding agent pet as a normal window", { petId: options.petId, position: fallbackPosition, wasVisible });
-      const replacement = createBasePetWindowWithMode(`OpenPets — ${options.displayName}`, fallbackPosition, {}, false);
-      installAgentPetWindow(replacement, options, dismissToken);
-      options.onWindowReplaced?.(replacement);
-      if (wasVisible) showPetWindowInactive(replacement);
-    },
-  );
-  if (!window.isDestroyed()) installAgentPetWindow(window, options, dismissToken);
-  return window;
-}
-
-function installAgentPetWindow(window: BrowserWindow, options: AgentPetWindowOptions, dismissToken?: string): void {
-  if (options.nativeActivities !== false) registerPetActivityWindow(window);
-  info("pet.window", "agent window create", { windowId: window.id, petId: options.petId, displayName: options.displayName, position: options.position, hasDisplay: Boolean(options.display), badge: options.badge });
-  installPetWindowInteraction(window, {
-    useWaylandNativeDrag: shouldUseWaylandNativePetDrag(),
-    readWindowPosition,
-    getThrowPhysics: getPetThrowPhysics,
-  }, options);
-  installMotionStatePublisher(window);
-  installPetContextMenu(window, { label: t("pet.menu.closePet"), click: options.onCloseRequested, focusSessionWindow: options.onFocusSessionWindow, petId: options.petId }, shouldUseLayerShellBackend);
-  void loadExplicitPetContent(window, options.petId, options.display, options.badge, dismissToken, options.scale);
-}
-
-export async function createDefaultPetRender(
-  paused: boolean,
-  display: PetTransientDisplay | null,
-  badge: PetStatusBadgeReaction | null,
-  dismissToken?: string,
-  pluginBubbles: PetPluginBubbles | null = null,
-): Promise<PetContentRender> {
-  return createDefaultPetRenderContent(
-    paused,
-    display,
-    badge,
-    dismissToken,
-    pluginBubbles,
-    shouldUseWaylandNativePetDrag() ? "drag" : "no-drag",
-  );
-}
-
-function createBasePetWindow(title: string, position: Point, focusOptions: { readonly hasInteractiveInput?: boolean } = {}, onLayerShellFatal?: (position: Point, wasVisible: boolean) => void): BrowserWindow {
-  return createBasePetWindowWithMode(title, position, focusOptions, shouldUseLayerShellBackend(), onLayerShellFatal);
-}
-
-/**
- * Whether the experimental native Wayland layer-shell backend should carry pet
- * windows. Opt-in via `OPENPETS_NATIVE_WAYLAND=1` and only when the native
- * helper binary is present. See `wayland-layer-backend.ts`.
- */
-export function shouldUseLayerShellBackend(): boolean {
-  return isLayerShellBackendRequested(process.platform, process.env) && isLayerShellHelperAvailable();
-}
-
-/** Show pet carriers only after Linux shell-exclusion hints are ready. */
-export function showPetWindowInactive(window: BrowserWindow): void {
-  if (window.isDestroyed()) return;
-  const coordinator = getPetWindowShowCoordinator(window);
-  if (!shouldSetX11PetWindowState(window)) {
-    coordinator.cancel();
-    cancelPetWindowX11MapLifecycle(window);
-    window.showInactive();
-    return;
+export function createPetWindow(): BrowserWindow {
+  if (petWindow && !petWindow.isDestroyed()) {
+    return petWindow;
   }
 
-  let lifecycle = petWindowX11MapLifecycles.get(window);
-  if (!lifecycle) {
-    try {
-      lifecycle = beginPetWindowX11MapLifecycle(window.getNativeWindowHandle(), process.env.DISPLAY);
-      petWindowX11MapLifecycles.set(window, lifecycle);
-      void lifecycle.finished.then(() => {
-        if (petWindowX11MapLifecycles.get(window) === lifecycle) petWindowX11MapLifecycles.delete(window);
-      });
-    } catch (error) {
-      coordinator.cancel();
-      logError("pet.window", "Linux X11 map watcher could not start; showing pet", { windowId: window.id, error: error instanceof Error ? error.message : String(error) });
-      window.showInactive();
-      return;
-    }
-  }
-  const showReady = lifecycle.ready.catch((error: unknown) => {
-    logError("pet.window", "showing pet after X11 shell exclusion failure", { windowId: window.id, error: error instanceof Error ? error.message : String(error) });
-  });
-  coordinator.schedule(showReady, () => {
-    if (window.isDestroyed()) return;
-    window.showInactive();
-  });
-}
+  currentLayout = "base";
+  const state = getAppState();
+  const size = getPetWindowSize(state.preferences.petScale);
+  const position = state.preferences.petPosition
+    ? clampPetPosition(state.preferences.petPosition, size)
+    : getDefaultPetPosition(size);
 
-/** Invalidates a pending readiness-gated show before hiding a reusable carrier. */
-export function hidePetWindow(window: BrowserWindow): void {
-  if (window.isDestroyed()) return;
-  getPetWindowShowCoordinator(window).cancel();
-  cancelPetWindowX11MapLifecycle(window);
-  window.hide();
-}
-
-function cancelPetWindowX11MapLifecycle(window: BrowserWindow): void {
-  const lifecycle = petWindowX11MapLifecycles.get(window);
-  if (!lifecycle) return;
-  petWindowX11MapLifecycles.delete(window);
-  lifecycle.cancel();
-}
-
-function getPetWindowShowCoordinator(window: BrowserWindow): PetWindowShowCoordinator {
-  const existing = petWindowShowCoordinators.get(window);
-  if (existing) return existing;
-  const coordinator = createPetWindowShowCoordinator();
-  petWindowShowCoordinators.set(window, coordinator);
-  return coordinator;
-}
-
-function shouldSetX11PetWindowState(window: BrowserWindow): boolean {
-  return process.platform === "linux" && !isEffectiveWaylandBackend() && petWindowLayerShellBackends.get(window) !== true;
-}
-
-function createBasePetWindowWithMode(title: string, position: Point, focusOptions: { readonly hasInteractiveInput?: boolean }, useLayerShell: boolean, onLayerShellFatal?: (position: Point, wasVisible: boolean) => void): BrowserWindow {
-  const effectiveWaylandBackend = isEffectiveWaylandBackend();
-  const focusable = shouldPetWindowBeFocusable(process.platform, effectiveWaylandBackend, focusOptions.hasInteractiveInput === true);
-  const window = new BrowserWindow({
-    title,
-    width: defaultPetWindowSize.width,
-    height: defaultPetWindowSize.height,
+  const created = new BrowserWindow({
+    title: "DeskPet",
+    width: size.width,
+    height: size.height,
     x: position.x,
     y: position.y,
     frame: false,
@@ -311,537 +102,469 @@ function createBasePetWindowWithMode(title: string, position: Point, focusOption
     minimizable: false,
     fullscreenable: false,
     skipTaskbar: true,
-    alwaysOnTop: true,
-    focusable,
+    alwaysOnTop: state.preferences.alwaysOnTop,
+    focusable: true,
     show: false,
     hasShadow: false,
     backgroundColor: "#00000000",
-    // In layer-shell mode this window never appears on screen — it only
-    // renders the pet page offscreen so its frames can be streamed to the
-    // native layer-shell helper. The visible pet is the helper's overlay
-    // surface, not this window. `paintWhenInitiallyHidden` must be a
-    // top-level option so the hidden renderer keeps painting (and therefore
-    // `beginFrameSubscription` keeps producing frames); `offscreen` and
-    // `backgroundThrottling` belong in webPreferences.
-    ...(useLayerShell ? { paintWhenInitiallyHidden: true } : {}),
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
-      preload: join(app.getAppPath(), "dist", "pet-preload.cjs"),
-      zoomFactor: 1,
-      ...(useLayerShell ? { offscreen: true, backgroundThrottling: false } : {}),
+      preload: join(app.getAppPath(), "pet-preload.cjs"),
     },
   });
-  petWindowLayerShellBackends.set(window, useLayerShell);
-  trackedPetWindows.add(window);
-  ensurePetWindowAlwaysOnTopTimer();
-  window.once("closed", () => {
-    cancelPetWindowX11MapLifecycle(window);
-    trackedPetWindows.delete(window);
-  });
-  pinPetWindowZoom(window);
 
-  petWindowFocusPolicy.set(window, focusable);
-  window.setMenu(null);
-  applyPetAlwaysOnTop(window);
-  window.on("show", () => reassertAllPetWindows());
-  window.on("restore", () => reassertAllPetWindows());
-  window.on("focus", () => reassertAllPetWindows());
-  window.on("blur", () => reassertAllPetWindows());
+  petWindow = created;
+  created.setMenu(null);
+  applyAlwaysOnTop();
 
-  // Show the pet window on all macOS Spaces (desktop workspaces).
-  // Without this, the window is bound to the Space where it was created
-  // and disappears when the user switches to another Space.
   if (process.platform === "darwin") {
-    window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    created.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   }
 
-  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-  window.webContents.on("will-navigate", (event, url) => {
-    if (isAllowedPetDocumentUrl(url)) return;
+  created.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  created.webContents.on("will-navigate", (event) => {
     event.preventDefault();
   });
-  window.webContents.on("will-redirect", (event) => {
-    event.preventDefault();
-  });
-  window.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
-    logError("pet.window", "renderer load failed", { windowId: window.id, errorCode, errorDescription });
-    console.error("Failed to load default pet window.", { errorCode, errorDescription });
-  });
-  window.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    const fields = { windowId: window.id, level, line, sourceId, message };
-    if (level >= 3) logError("pet.window", "renderer console", fields);
-    else if (level === 2) warn("pet.window", "renderer console", fields);
-    else debug("pet.window", "renderer console", fields);
-  });
-  window.webContents.on("render-process-gone", (_event, details) => {
-    logError("pet.window", "renderer process gone", { windowId: window.id, details });
-    console.error("Default pet renderer process gone.", details);
+  created.webContents.on("render-process-gone", (_event, details) => {
+    logError("pet.window", "renderer process gone", { details });
   });
 
-  if (useLayerShell) {
-    try {
-      // Adopt the window into a native layer-shell surface. This patches the
-      // display-facing methods on the instance so the rest of the pet stack
-      // (controllers, motion engine, content loading) keeps working unchanged
-      // while the visible carrier is the helper's overlay surface.
-      const surface = adoptPetWindowForLayerShell(window, position);
-      // Asynchronous startup/runtime failure (helper cannot start, keeps
-      // dying, never becomes ready) — tear the offscreen window down and let
-      // the caller rebuild the pet as a normal visible window.
-      surface.onFatal = () => {
-        if (window.isDestroyed()) return;
-        logError("pet.window", "layer-shell backend fatal; falling back to a normal window", {});
-        // Build and publish the replacement first. The old window's `closed`
-        // listener can then see that it no longer owns the controller slot and
-        // must not clear the replacement's state.
-        try {
-          onLayerShellFatal?.(readWindowPosition(window), window.isVisible());
-        } catch (error) {
-          logError("pet.window", "normal-window fallback failed", error instanceof Error ? error : { error });
-        } finally {
-          try {
-            if (!window.isDestroyed()) window.destroy();
-          } catch {
-            // window may already be gone
-          }
-        }
-      };
-    } catch (error) {
-      logError("pet.window", "layer-shell adoption failed; falling back to a normal window", error instanceof Error ? error : { error });
-      if (!window.isDestroyed()) window.destroy();
-      return createBasePetWindowWithMode(title, position, focusOptions, false);
+  created.on("close", (event) => {
+    if (quitting) {
+      return;
     }
-  }
+    event.preventDefault();
+    created.hide();
+    hooks?.onVisibilityChanged();
+  });
 
-  return window;
+  created.on("move", schedulePositionSave);
+  created.on("moved", savePositionNow);
+  created.on("closed", () => {
+    if (petWindow === created) {
+      petWindow = null;
+      currentLayout = "base";
+    }
+  });
+  created.on("show", () => applyAlwaysOnTop());
+  created.on("restore", () => applyAlwaysOnTop());
+
+  registerPetWindowIpc();
+  void loadPetContent();
+  logInfo("pet.window", "window created", { position, size, petId: getCurrentPet().id });
+  return created;
 }
 
-function applyPetAlwaysOnTop(window: BrowserWindow): void {
-  if (window.isDestroyed()) return;
+export function showPetWindow(): void {
+  const window = createPetWindow();
+  const [x, y] = window.getPosition();
+  const size = window.getBounds();
+  const clamped = clampPetPosition({ x, y }, size);
+  window.setPosition(clamped.x, clamped.y, false);
+  applyAlwaysOnTop();
+  window.showInactive();
+  hooks?.onVisibilityChanged();
+}
 
-  // Layer-shell pets (Wayland) rely on the native helper for Z-order; Electron's
-  // setAlwaysOnTop is a no-op there. Degrade gracefully and record this instead of
-  // silently claiming success, so a helper failure is observable in the logs.
-  if (petWindowLayerShellBackends.get(window) === true) {
-    if (!loggedWaylandTopmost.has(window)) {
-      loggedWaylandTopmost.add(window);
-      info("pet.window", "always-on-top delegated to Wayland layer-shell helper", { windowId: window.id });
-    }
+export function hidePetWindow(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
     return;
   }
+  savePositionNow();
+  applyLayoutSize("base");
+  petWindow.hide();
+  hooks?.onVisibilityChanged();
+}
 
-  try {
-    if (process.platform === "win32" && window.isAlwaysOnTop()) {
-      window.setAlwaysOnTop(false);
-    }
-    window.setAlwaysOnTop(true, process.platform === "linux" ? "screen-saver" : "floating");
-    if (process.platform === "linux") {
-      window.setVisibleOnAllWorkspaces(true);
-    }
-  } catch (error) {
-    logError("pet.window", "always-on-top could not be honored", { windowId: window.id, platform: process.platform, error: error instanceof Error ? error.message : String(error) });
+export function togglePetWindow(): void {
+  if (isPetWindowVisible()) {
+    hidePetWindow();
+  } else {
+    showPetWindow();
   }
 }
 
-export async function loadDefaultPetContent(window: BrowserWindow, paused: boolean, display: PetTransientDisplay | null = null, badge: PetStatusBadgeReaction | null = null, dismissToken?: string, pluginBubbles: PetPluginBubbles | null = null): Promise<void> {
-  preparePetActivityRender(window, paused || Boolean(display || badge || pluginBubbles?.transient || pluginBubbles?.pinned?.bubble.input));
-  const sequence = allocateWindowLoadSequence(window);
-  debug("pet.window", "default content render begin", { windowId: window.id, sequence, paused, hasDisplay: Boolean(display), reaction: display?.reaction, hasMessage: Boolean(display?.message), badge, hasPluginBubble: Boolean(pluginBubbles?.transient), hasPinned: Boolean(pluginBubbles?.pinned), defaultPetId: getAppStateSnapshot().preferences.defaultPetId });
-  applyPetWindowFocusPolicy(window, petPluginBubblesHaveInteractiveInput(pluginBubbles) || isDefaultPetCarrierExpanded() || isDefaultPetChatCompactOpen());
-  const render = await createDefaultPetRender(paused, display, badge, dismissToken, pluginBubbles);
-  if (windowLoadSequences.get(window) === sequence) {
-    updatePetGazeConfiguration(window, render, render.flipped);
-    updatePetActivityRender(window, render);
+export function focusPetWindow(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
   }
-  const hasPinned = Boolean(pluginBubbles?.pinned);
-  const bubbleHtml = createBubbleMarkup(display, paused, badge, dismissToken, pluginBubbles);
-  const hasBubble = Boolean(bubbleHtml.trim());
-  applyLinuxPetWindowShape(window, getAppStateSnapshot().preferences.petScale as PetScaleValue, hasBubble, hasPinned);
-  if (tryUpdateLoadedPetContent(window, render, "default", sequence)) return;
-  await loadPetHtmlFile(window, render.html, "default", sequence).then(() => {
-    petWindowRenderCache.set(window, render.cacheKey);
-    if (windowLoadSequences.get(window) === sequence) updatePetGazeConfiguration(window, render, render.flipped);
-  }).catch((error: unknown) => {
-    logError("pet.window", "default content load failed", error instanceof Error ? error : { error });
-    console.error("Failed to load default pet URL.", error);
-  });
-}
-
-export async function loadExplicitPetContent(window: BrowserWindow, petId: string, display: PetTransientDisplay | null = null, badge: PetStatusBadgeReaction | null = null, dismissToken?: string, scaleOverride?: PetScaleValue, pluginBubbles: PetPluginBubbles | null = null): Promise<void> {
-  preparePetActivityRender(window, Boolean(display || badge || pluginBubbles?.transient || pluginBubbles?.pinned?.bubble.input));
-  const sequence = allocateWindowLoadSequence(window);
-  try {
-    applyPetWindowFocusPolicy(window, petPluginBubblesHaveInteractiveInput(pluginBubbles));
-    const state = getAppStateSnapshot();
-    const pet = state.pets.installed.find((candidate) => candidate.id === petId);
-    if (!pet || pet.broken) {
-      throw new Error(`Cannot render explicit pet: ${petId}`);
-    }
-    debug("pet.window", "explicit content render begin", { windowId: window.id, sequence, petId, displayName: pet.displayName, hasDisplay: Boolean(display), reaction: display?.reaction, hasMessage: Boolean(display?.message), badge });
-    const scale = scaleOverride ?? state.preferences.petScale as PetScaleValue;
-    const render = pet.id === builtInPet.id
-      ? createBuiltInPetRender(false, display, badge, scale, `explicit:${pet.id}`, pet.id, dismissToken, pluginBubbles, "agent", shouldUseWaylandNativePetDrag() ? "drag" : "no-drag")
-      : await createInstalledPetRender(
-        pet.id,
-        pet.displayName,
-        false,
-        display,
-        scale,
-        badge,
-        `explicit:${pet.id}`,
-        dismissToken,
-        pluginBubbles,
-        pet.source?.kind === "team" ? "team" : "personal",
-        "agent",
-        undefined,
-        shouldUseWaylandNativePetDrag() ? "drag" : "no-drag",
-      );
-    if (windowLoadSequences.get(window) === sequence) {
-      updatePetGazeConfiguration(window, render, render.flipped);
-      updatePetActivityRender(window, render);
-    }
-    const hasPinned = Boolean(pluginBubbles?.pinned);
-    const bubbleHtml = createBubbleMarkup(display, false, badge, dismissToken, pluginBubbles);
-    const hasBubble = Boolean(bubbleHtml.trim());
-    applyLinuxPetWindowShape(window, scale, hasBubble, hasPinned);
-    if (tryUpdateLoadedPetContent(window, render, `explicit-${pet.id}`, sequence)) return;
-    await loadPetHtmlFile(window, render.html, `explicit-${pet.id}`, sequence);
-    petWindowRenderCache.set(window, render.cacheKey);
-    if (windowLoadSequences.get(window) === sequence) updatePetGazeConfiguration(window, render, render.flipped);
-  } catch (error: unknown) {
-    logError("pet.window", "explicit content load failed", error instanceof Error ? error : { petId, error });
-    console.error(`Failed to load explicit pet ${petId} URL.`, error);
+  if (!petWindow.isVisible()) {
+    petWindow.show();
   }
+  petWindow.focus();
+  petWindow.webContents.focus();
 }
 
-function petPluginBubblesHaveInteractiveInput(pluginBubbles: PetPluginBubbles | null | undefined): boolean {
-  return Boolean(pluginBubbles?.transient?.bubble.input || pluginBubbles?.pinned?.bubble.input);
+export function applyPetWindowPreferences(): void {
+  applyAlwaysOnTop();
 }
 
-function applyPetWindowFocusPolicy(window: BrowserWindow, hasInteractiveInput: boolean): void {
-  if (window.isDestroyed()) return;
-  const effectiveWaylandBackend = isEffectiveWaylandBackend();
-  const focusable = shouldPetWindowBeFocusable(process.platform, effectiveWaylandBackend, hasInteractiveInput);
-  if (petWindowFocusPolicy.get(window) === focusable) return;
-  try {
-    window.setFocusable(focusable);
-    petWindowFocusPolicy.set(window, focusable);
-    debug("pet.window", "focus policy applied", { windowId: window.id, focusable, hasInteractiveInput, platform: process.platform, effectiveWaylandBackend });
-  } catch (error) {
-    logError("pet.window", "focus policy failed", error instanceof Error ? error : { windowId: window.id, focusable, hasInteractiveInput, error });
+export function refreshPetWindow(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    createPetWindow();
+    return;
   }
+  applyAlwaysOnTop();
+  applyLayoutSize(currentLayout);
+  void loadPetContent();
 }
 
-export function setPetReactionState(window: BrowserWindow, state: UniversalSpriteState): void {
-  if (window.isDestroyed()) return;
-  setPetActivityReactionOverride(window, state !== "idle");
-  setPetGazeReactionState(window, state);
-  window.webContents.send("openpets:pet-reaction-state", state);
-}
-
-/** Override the pet sprite with a plugin-bundled spritesheet strip (§5), or clear with null. */
-export function setPetSpriteOverride(window: BrowserWindow, override: { readonly filePath: string; readonly fps: number; readonly loop: boolean } | null): void {
-  if (window.isDestroyed()) return;
-  setPetActivityPluginOverride(window, override !== null);
-  setPetGazePluginOverride(window, override !== null);
-  window.webContents.send("openpets:pet-sprite-override", override ? { fileUrl: pathToFileURL(override.filePath).toString(), fps: override.fps, loop: override.loop } : null);
-}
-
-/** Scale override for a single pet window (plugin setScale). */
-export function setPetWindowScale(window: BrowserWindow, scale: number): void {
-  if (window.isDestroyed()) return;
-  setPetActivityScale(window, scale);
-  setPetGazeScale(window, scale);
-  window.webContents.send("openpets:pet-scale-override", scale);
-}
-
-/** Play a sound through the pet window's WebAudio pipeline. */
-export function playPetWindowAudio(window: BrowserWindow, payload: PetWindowAudioPayload): void {
-  if (window.isDestroyed()) return;
-  window.webContents.send("openpets:play-audio", payload);
-}
-
-export function stopPetWindowAudio(window: BrowserWindow): void {
-  if (window.isDestroyed()) return;
-  window.webContents.send("openpets:stop-audio");
-}
-
-/** Speak text via the renderer speechSynthesis voice (plugin voice.speak). */
-export function speakPetWindowTts(window: BrowserWindow, text: string, opts: { readonly voice?: string; readonly rate?: number; readonly requestId?: string }): void {
-  if (window.isDestroyed()) return;
-  const requestId = opts.requestId ?? `pet-tts-${window.id}-${++petWindowSpeechSequence}`;
-  startPetActivitySpeech(window, requestId);
-  window.webContents.send("openpets:tts-speak", { text, voice: opts.voice, rate: opts.rate, requestId });
-}
-
-export function stopPetWindowTts(window: BrowserWindow, requestId?: string): void {
-  if (window.isDestroyed()) return;
-  finishPetActivitySpeech(window, requestId);
-  window.webContents.send("openpets:tts-stop", { requestId });
-}
-
-function tryUpdateLoadedPetContent(window: BrowserWindow, render: PetContentRender, name: string, sequence: number): boolean {
-  if (window.isDestroyed() || window.webContents.isDestroyed()) return false;
-  if (!isLatestPetRenderSequence(windowLoadSequences.get(window), sequence)) {
-    debug("pet.window", "content update skipped", { windowId: window.id, name, sequence, latestSequence: windowLoadSequences.get(window), reason: "superseded" });
-    return false;
+export function resetPetWindowPosition(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    createPetWindow();
+    return;
   }
-  if (petWindowRenderCache.get(window) !== render.cacheKey) return false;
-  const url = window.webContents.getURL();
-  if (!isAllowedPetDocumentUrl(url)) return false;
-  updatePetGazeConfiguration(window, render, render.flipped);
-  debug("pet.window", "content update in place", { windowId: window.id, name, sequence, reactionState: render.reactionState });
-  window.webContents.send("openpets:pet-content-state", {
-    bodyHtml: render.bodyHtml,
-    displayName: render.displayName,
-    assetName: render.assetName,
-    reactionState: render.reactionState,
-  });
-  return true;
+  const baseSize = getPetWindowSize(getAppState().preferences.petScale);
+  const basePosition = getDefaultPetPosition(baseSize);
+  const targetSize = getWindowSizeForLayout(currentLayout);
+  const targetPosition = clampPetPosition({
+    x: basePosition.x + baseSize.width / 2 - targetSize.width / 2,
+    y: basePosition.y + baseSize.height - targetSize.height,
+  }, targetSize);
+  petWindow.setBounds({
+    x: targetPosition.x,
+    y: targetPosition.y,
+    width: targetSize.width,
+    height: targetSize.height,
+  }, false);
+  setPetPosition(basePosition);
 }
 
-export function getSafeDefaultPetPosition(position: Point | undefined): Point {
-  const pos = position ?? getDefaultPetInitialPosition();
-  if (isCrossDisplayRoamingEnabled()) return clampToNearestDisplayIfOffscreen(pos, defaultPetWindowSize);
-  return clampToVisibleWorkArea(pos, defaultPetWindowSize);
-}
-
-export function readWindowPosition(window: BrowserWindow): Point {
-  const [x, y] = window.getPosition();
-  const bounds = window.getBounds();
-  let rawPos: Point = { x, y };
-  if (bounds.width > defaultPetWindowSize.width || bounds.height > defaultPetWindowSize.height) {
-    rawPos = toCollapsedPosition(rawPos, { width: bounds.width, height: bounds.height }, defaultPetWindowSize);
+export function setPetConversationLayout(layout: PetWindowLayout): void {
+  currentLayout = layout;
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
   }
-  if (isCrossDisplayRoamingEnabled()) return clampToNearestDisplayIfOffscreen(rawPos, defaultPetWindowSize);
-  return clampToVisibleWorkArea(rawPos, defaultPetWindowSize);
+  applyLayoutSize(layout);
 }
 
-function applyLinuxPetWindowShape(window: BrowserWindow, scale: PetScaleValue, hasBubble: boolean, hasPinned = false): void {
-  if (process.platform !== "linux" || window.isDestroyed()) return;
-
-  const isExpanded = isDefaultPetCarrierExpanded();
-  const bounds = window.getBounds();
-  const hudScale = getAppStateSnapshot().preferences.hudScale as HudScaleValue;
-  const { shape } = calculatePetInteractiveShape({
-    windowWidth: bounds.width,
-    windowHeight: bounds.height,
-    spriteWidth: defaultPetSprite.frameWidth,
-    spriteHeight: defaultPetSprite.frameHeight,
-    scale,
-    hasBubble,
-    hasPinned,
-    hudScale,
-    isExpanded,
-    isCompactOpen: !isExpanded && isDefaultPetChatCompactOpen(),
-    isSessionOpen: isDefaultPetSessionOpen(),
-    panelHeight: isExpanded ? getActiveChatPanelHeight() : undefined,
-  });
-
-  // setShape's rects are undocumented as to units, but empirically the window's
-  // true on-screen size/position are scaled by the display's scaleFactor, while
-  // window.getBounds()/getContentBounds() unreliably report values close to the
-  // unscaled logical size instead of the true physical geometry — so getBounds()
-  // must not be used here. Scale the DIP-computed rect by the live scaleFactor
-  // directly instead.
-  const scaleFactor = screen.getDisplayMatching(bounds).scaleFactor;
-  const physicalShape: Electron.Rectangle[] = scaleFactor === 1 ? [...shape] : shape.map((rect) => ({
-    x: Math.round(rect.x * scaleFactor),
-    y: Math.round(rect.y * scaleFactor),
-    width: Math.round(rect.width * scaleFactor),
-    height: Math.round(rect.height * scaleFactor),
-  }));
-
-  try {
-    window.setShape(physicalShape);
-    debug("pet.window", "linux window shape applied", { windowId: window.id, scale, hasBubble, hasPinned, hudScale, scaleFactor, shape: physicalShape });
-  } catch (error) {
-    logError("pet.window", "linux window shape failed", error instanceof Error ? error : { error });
+export function sendPetConversationView(view: PetConversationView): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
   }
+  petWindow.webContents.send("deskpet:conversation-view", view);
 }
 
-export function applyLinuxPetWindowShapeWithExpansion(
-  window: BrowserWindow,
-  isExpanded: boolean,
-  isCompactOpen = isDefaultPetChatCompactOpen(),
-  panelHeight = isExpanded ? getActiveChatPanelHeight() : undefined,
-): void {
-  if (process.platform !== "linux" || window.isDestroyed()) return;
-
-  const state = getAppStateSnapshot();
-  const scale = state.preferences.petScale as PetScaleValue;
-  const hudScale = state.preferences.hudScale as HudScaleValue;
-  const bounds = window.getBounds();
-  const { shape } = calculatePetInteractiveShape({
-    windowWidth: bounds.width,
-    windowHeight: bounds.height,
-    spriteWidth: defaultPetSprite.frameWidth,
-    spriteHeight: defaultPetSprite.frameHeight,
-    scale,
-    hasBubble: false,
-    hudScale,
-    isExpanded,
-    isCompactOpen: !isExpanded && isCompactOpen,
-    isSessionOpen: isDefaultPetSessionOpen(),
-    panelHeight,
-  });
-
-  const scaleFactor = screen.getDisplayMatching(bounds).scaleFactor;
-  const physicalShape: Electron.Rectangle[] = scaleFactor === 1 ? [...shape] : shape.map((rect) => ({
-    x: Math.round(rect.x * scaleFactor),
-    y: Math.round(rect.y * scaleFactor),
-    width: Math.round(rect.width * scaleFactor),
-    height: Math.round(rect.height * scaleFactor),
-  }));
-
-  try {
-    window.setShape(physicalShape);
-    debug("pet.window", "linux window shape applied with expansion", { windowId: window.id, isExpanded, isCompactOpen, scaleFactor, shape: physicalShape });
-  } catch (error) {
-    logError("pet.window", "linux window shape with expansion failed", error instanceof Error ? error : { error });
+export function sendPetAudio(bytes: Uint8Array): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
   }
+  petWindow.webContents.send("deskpet:tts-audio", bytes);
 }
 
-export function refreshDefaultPetFocusPolicy(window: BrowserWindow): void {
-  if (window.isDestroyed()) return;
-  const expanded = isDefaultPetCarrierExpanded();
-  applyPetWindowFocusPolicy(window, expanded || isDefaultPetChatCompactOpen());
+export function resetPetPlayback(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  petWindow.webContents.send("deskpet:playback-reset");
 }
 
-function installMotionStatePublisher(window: BrowserWindow): void {
-  registerPetGazeWindow(window);
-  let lastX = window.getPosition()[0];
-  let lastSent: PetMotionState = "idle";
-  let idleTimer: NodeJS.Timeout | null = null;
-
-  const sendMotionState = (state: PetMotionState): void => {
-    if (window.isDestroyed() || lastSent === state) return;
-    lastSent = state;
-    setPetGazeMotionState(window, state);
-    window.webContents.send("openpets:pet-motion", state);
-  };
-
-  const scheduleIdle = (): void => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      idleTimer = null;
-      sendMotionState("idle");
-    }, 180);
-  };
-
-  const handleMove = (): void => {
-    if (window.isDestroyed()) return;
-    movePetActivityWindow(window);
-    suspendPetGazeForMovement(window);
-    const [x] = window.getPosition();
-    const deltaX = x - lastX;
-    lastX = x;
-
-    if (Math.abs(deltaX) >= 3) {
-      sendMotionState(deltaX > 0 ? "run-right" : "run-left");
-    }
-    scheduleIdle();
-  };
-
-  window.on("move", handleMove);
-  window.on("moved", handleMove);
-  window.webContents.on("did-finish-load", () => {
-    lastSent = "idle";
-    setPetGazeMotionState(window, "idle");
-    window.webContents.send("openpets:pet-motion", "idle");
-  });
-  window.on("closed", () => {
-    if (idleTimer) clearTimeout(idleTimer);
-  });
+export function startPetCapture(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  petWindow.webContents.send("deskpet:voice-capture-start");
 }
 
-/**
- * Keep the pet window at 1x zoom. Chromium remembers zoom per host and every
- * file:// page shares one host, so a zoom set on another local page leaks in.
- * The pet page is laid out in window pixels (carrier bounds, hit-testing, the
- * session overlay's measured height), so any zoom desyncs it from the window.
- */
-function pinPetWindowZoom(window: BrowserWindow): void {
-  const reset = () => {
-    if (window.isDestroyed() || window.webContents.isDestroyed()) return;
-    if (window.webContents.getZoomFactor() !== 1) {
-      debug("pet.window", "pet window zoom reset", { zoomFactor: window.webContents.getZoomFactor(), windowId: window.id });
-      window.webContents.setZoomFactor(1);
-    }
-  };
-  window.webContents.on("did-finish-load", reset);
-  window.webContents.on("zoom-changed", reset);
-  window.webContents.setVisualZoomLevelLimits(1, 1).catch((error: unknown) => {
-    warn("pet.window", "pet window pinch-zoom lock failed", { error: error instanceof Error ? error.message : String(error) });
-  });
+export function stopPetCapture(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  petWindow.webContents.send("deskpet:voice-capture-stop");
 }
 
-function isAllowedPetDocumentUrl(url: string): boolean {
-  return url.startsWith("data:text/html") || url.startsWith("file://");
-}
-
-function allocateWindowLoadSequence(window: BrowserWindow): number {
-  const sequence = (windowLoadSequences.get(window) ?? 0) + 1;
-  windowLoadSequences.set(window, sequence);
-  return sequence;
-}
-
-async function loadPetHtmlFile(window: BrowserWindow, html: string, name: string, sequence: number): Promise<void> {
-  const safeName = name.replace(/[^a-z0-9_-]/gi, "-").slice(0, 80) || "pet";
-
-  const previous = windowLoadChains.get(window) ?? Promise.resolve();
-  const next = previous.catch(() => {}).then(async () => {
-    if (window.isDestroyed()) {
-      debug("pet.window", "load skipped", { windowId: window.id, name: safeName, sequence, reason: "destroyed" });
-      return;
-    }
-
-    if (windowLoadSequences.get(window) !== sequence) {
-      debug("pet.window", "load skipped", { windowId: window.id, name: safeName, sequence, latestSequence: windowLoadSequences.get(window), reason: "superseded" });
-      return;
-    }
-
-    const dir = join(app.getPath("userData"), "rendered-pets");
-    await mkdir(dir, { recursive: true });
-    const filePath = join(dir, `${safeName}.html`);
-    await writeFile(filePath, html, "utf8");
-    if (window.isDestroyed()) {
-      debug("pet.window", "load skipped", { windowId: window.id, name: safeName, sequence, reason: "destroyed-after-write" });
-      return;
-    }
-    debug("pet.window", "load file begin", { windowId: window.id, name: safeName, sequence, filePath });
-    window.setIgnoreMouseEvents(false);
-    try {
-      await window.loadFile(filePath);
-      debug("pet.window", "load file complete", { windowId: window.id, name: safeName, sequence, url: window.webContents.getURL() });
-    } catch (error) {
+export function playPetReaction(reaction: PetReaction): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  const window = petWindow;
+  window.webContents.send("deskpet:reaction", reaction);
+  if (reactionTimer) {
+    clearTimeout(reactionTimer);
+    reactionTimer = null;
+  }
+  if (reaction !== "idle") {
+    reactionTimer = setTimeout(() => {
+      reactionTimer = null;
       if (!window.isDestroyed()) {
-        if (process.platform === "linux") window.setIgnoreMouseEvents(false);
-        else window.setIgnoreMouseEvents(true, { forward: true });
+        window.webContents.send("deskpet:reaction", "idle");
       }
-      logError("pet.window", "load file rejected", error instanceof Error ? error : { windowId: window.id, name: safeName, sequence, error });
-      throw error;
-    }
-  });
-
-  windowLoadChains.set(window, next);
-  void next.catch(() => {}).finally(() => {
-    if (windowLoadChains.get(window) === next) windowLoadChains.delete(window);
-  });
-
-  return next;
+    }, reactionDurationMs(reaction));
+  }
 }
 
-function debounce(callback: () => void, delayMs: number): () => void {
-  let timeout: NodeJS.Timeout | undefined;
+export function savePositionNow(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  const bounds = petWindow.getBounds();
+  const baseSize = getPetWindowSize(getAppState().preferences.petScale);
+  const basePosition = clampPetPosition({
+    x: bounds.x + bounds.width / 2 - baseSize.width / 2,
+    y: bounds.y + bounds.height - baseSize.height,
+  }, baseSize);
+  setPetPosition(basePosition);
+}
 
-  return () => {
-    if (timeout) {
-      clearTimeout(timeout);
+export function preparePetWindowForQuit(): void {
+  quitting = true;
+  savePositionNow();
+  if (reactionTimer) {
+    clearTimeout(reactionTimer);
+    reactionTimer = null;
+  }
+}
+
+function schedulePositionSave(): void {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+  }
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    savePositionNow();
+  }, 250);
+}
+
+function applyAlwaysOnTop(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  petWindow.setAlwaysOnTop(getAppState().preferences.alwaysOnTop);
+}
+
+function getWindowSizeForLayout(layout: PetWindowLayout): WindowSize {
+  const baseSize = getPetWindowSize(getAppState().preferences.petScale);
+  if (layout === "chat") {
+    return {
+      width: Math.max(baseSize.width, CHAT_PANEL_MIN_WIDTH),
+      height: baseSize.height + CHAT_PANEL_EXTRA_HEIGHT,
+    };
+  }
+  if (layout === "voice") {
+    return {
+      width: Math.max(baseSize.width, VOICE_PANEL_MIN_WIDTH),
+      height: baseSize.height + VOICE_PANEL_EXTRA_HEIGHT,
+    };
+  }
+  return baseSize;
+}
+
+function applyLayoutSize(layout: PetWindowLayout): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  const targetSize = getWindowSizeForLayout(layout);
+  const bounds = petWindow.getBounds();
+  const anchorX = bounds.x + bounds.width / 2;
+  const anchorBottom = bounds.y + bounds.height;
+  const position = clampPetPosition({
+    x: anchorX - targetSize.width / 2,
+    y: anchorBottom - targetSize.height,
+  }, targetSize);
+  if (bounds.width === targetSize.width && bounds.height === targetSize.height && bounds.x === position.x && bounds.y === position.y) {
+    return;
+  }
+  petWindow.setBounds({
+    x: position.x,
+    y: position.y,
+    width: targetSize.width,
+    height: targetSize.height,
+  }, false);
+  if (layout === "base") {
+    setPetPosition(position);
+  }
+}
+
+async function loadPetContent(): Promise<void> {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  const pet = getCurrentPet();
+  const scale = getAppState().preferences.petScale;
+  try {
+    await petWindow.loadFile(join(app.getAppPath(), "pet.html"), {
+      query: {
+        petId: pet.id,
+        petName: pet.displayName,
+        scale: String(scale),
+        spriteVersion: String(pet.spriteVersion),
+      },
+    });
+    hooks?.onContentLoaded();
+  } catch (error) {
+    logError("pet.window", "pet content load failed", {
+      petId: pet.id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function registerPetWindowIpc(): void {
+  if (ipcRegistered) {
+    return;
+  }
+  ipcRegistered = true;
+
+  ipcMain.on("deskpet:drag-start", (event) => {
+    if (!isFromPetWindow(event) || !petWindow) {
+      return;
     }
+    const [windowX, windowY] = petWindow.getPosition();
+    const cursor = screen.getCursorScreenPoint();
+    dragState = { cursorX: cursor.x, cursorY: cursor.y, windowX, windowY };
+    petWindow.webContents.send("deskpet:motion", "idle");
+  });
 
-    timeout = setTimeout(callback, delayMs);
-  };
+  ipcMain.on("deskpet:drag-move", (event) => {
+    if (!isFromPetWindow(event) || !petWindow || !dragState) {
+      return;
+    }
+    const cursor = screen.getCursorScreenPoint();
+    const dx = cursor.x - dragState.cursorX;
+    const dy = cursor.y - dragState.cursorY;
+    if (Math.abs(dx) > 4) {
+      petWindow.webContents.send("deskpet:motion", dx > 0 ? "right" : "left");
+    }
+    const size = petWindow.getBounds();
+    const target = clampPetPosition({ x: dragState.windowX + dx, y: dragState.windowY + dy }, {
+      width: size.width,
+      height: size.height,
+    });
+    petWindow.setPosition(target.x, target.y, false);
+  });
+
+  ipcMain.on("deskpet:drag-end", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    dragState = null;
+    petWindow?.webContents.send("deskpet:motion", "idle");
+    savePositionNow();
+  });
+
+  ipcMain.on("deskpet:pet-clicked", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    playPetReaction("waving");
+    hooks?.onChatToggle();
+  });
+
+  ipcMain.on("deskpet:open-control-center", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    hooks?.onOpenControlCenter();
+  });
+
+  ipcMain.on("deskpet:context-menu", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    showPetContextMenu();
+  });
+
+  ipcMain.on("deskpet:chat-send", (event, text: unknown) => {
+    if (!isFromPetWindow(event) || typeof text !== "string") {
+      return;
+    }
+    const trimmed = text.trim().slice(0, maxChatMessageLength);
+    if (trimmed.length > 0) {
+      hooks?.onChatSend(trimmed);
+    }
+  });
+
+  ipcMain.on("deskpet:chat-close", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    hooks?.onChatClose();
+  });
+
+  ipcMain.on("deskpet:mic-chunk", (event, chunk: unknown) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    const bytes = toBytes(chunk);
+    if (!bytes || bytes.byteLength === 0 || bytes.byteLength > maxAudioChunkBytes) {
+      return;
+    }
+    hooks?.onMicChunk(bytes);
+  });
+
+  ipcMain.on("deskpet:mic-ended", (event) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    hooks?.onMicEnded();
+  });
+
+  ipcMain.on("deskpet:mic-error", (event, message: unknown) => {
+    if (!isFromPetWindow(event)) {
+      return;
+    }
+    hooks?.onMicError(typeof message === "string" && message.length > 0 ? message : "麦克风不可用。");
+  });
+}
+
+function showPetContextMenu(): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    return;
+  }
+  const currentPet = getCurrentPet();
+  const menu = Menu.buildFromTemplate([
+    { label: `当前宠物：${currentPet.displayName}`, enabled: false },
+    { type: "separator" },
+    {
+      label: "AI语音对话",
+      click: () => {
+        hooks?.onChatToggle();
+      },
+    },
+    {
+      label: "打开控制中心",
+      click: () => hooks?.onOpenControlCenter(),
+    },
+    { type: "separator" },
+    { label: "挥手", click: () => playPetReaction("waving") },
+    { label: "跳跃", click: () => playPetReaction("jumping") },
+    { label: "思考", click: () => playPetReaction("review") },
+    { label: "等待", click: () => playPetReaction("waiting") },
+    { type: "separator" },
+    {
+      label: "隐藏宠物",
+      click: () => hidePetWindow(),
+    },
+    {
+      label: "退出 DeskPet",
+      click: () => {
+        preparePetWindowForQuit();
+        app.quit();
+      },
+    },
+  ]);
+  menu.popup({ window: petWindow });
+}
+
+function isFromPetWindow(event: IpcMainEvent): boolean {
+  return Boolean(petWindow && !petWindow.isDestroyed() && event.sender === petWindow.webContents);
+}
+
+function toBytes(value: unknown): Uint8Array | null {
+  if (value instanceof ArrayBuffer) {
+    return new Uint8Array(value);
+  }
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  }
+  return null;
 }

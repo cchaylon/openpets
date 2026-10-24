@@ -2,39 +2,15 @@ import { join } from "node:path";
 
 import { app, nativeImage, type NativeImage } from "electron";
 
-const trayIconRelativePath = join("assets", "tray-icon.png");
-const appIconRelativePath = join("assets", "app-icon.png");
-let cachedAppIcon: NativeImage | null = null;
-
-export function createAppIcon(): NativeImage {
-  if (cachedAppIcon && !cachedAppIcon.isEmpty()) return cachedAppIcon;
-
-  const assetPath = join(app.getAppPath(), appIconRelativePath);
-  const assetImage = nativeImage.createFromPath(assetPath);
-
-  if (!assetImage.isEmpty()) {
-    cachedAppIcon = assetImage;
-    return cachedAppIcon;
-  }
-
-  console.error(`OpenPets app icon asset could not be loaded from ${assetPath}; using generated fallback icon.`);
-  cachedAppIcon = createFallbackTrayIcon();
-  return cachedAppIcon;
-}
-
 export function createTrayIcon(): NativeImage {
-  const assetPath = join(app.getAppPath(), trayIconRelativePath);
+  const assetPath = join(app.getAppPath(), "assets", "tray-icon.png");
   const assetImage = nativeImage.createFromPath(assetPath);
 
   if (!assetImage.isEmpty()) {
-    // Render the tray icon as a full-colour image. We intentionally do NOT
-    // mark it as a macOS template image: template images are drawn as a
-    // monochrome (black) silhouette derived from the alpha channel, which
-    // discarded the colour artwork and made the tray icon appear fully black.
     return assetImage.resize({ width: 22, height: 22 });
   }
 
-  console.error(`OpenPets tray icon asset could not be loaded from ${assetPath}; using generated fallback icon.`);
+  console.error(`DeskPet tray icon could not be loaded from ${assetPath}; using generated fallback.`);
   return createFallbackTrayIcon();
 }
 
@@ -56,23 +32,15 @@ function createFallbackTrayIcon(): NativeImage {
   drawCircle(bitmap, size, 21, 13, 1, 17, 24, 39, 255);
 
   for (let x = 10; x <= 22; x += 1) {
-    const y = Math.round(21 + Math.sin((x - 10) / 12 * Math.PI) * 3);
+    const y = Math.round(21 + Math.sin(((x - 10) / 12) * Math.PI) * 3);
     drawCircle(bitmap, size, x, y, 1, 249, 250, 251, 255);
   }
 
-  const image = nativeImage.createFromBitmap(bitmap, {
+  return nativeImage.createFromBitmap(bitmap, {
     width: size,
     height: size,
     scaleFactor: 1,
   });
-
-  if (image.isEmpty()) {
-    console.error("OpenPets tray icon creation produced an empty image.");
-  }
-
-  // Keep the generated fallback in full colour as well (no template image),
-  // so it matches the colour tray artwork instead of rendering black on macOS.
-  return image;
 }
 
 function isRoundedSquarePixel(x: number, y: number, size: number, radius: number): boolean {
